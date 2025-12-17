@@ -1,0 +1,19 @@
+{
+  "name": "subscription-tracker-backend",
+  "version": "1.0.0",
+  "description": "Subscription tracker backend - detects recurring payments from email",
+  "main": "server-v2.js",
+  "scripts": {
+    "start": "node server-v2.js",
+    "dev": "node server-v2.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "express-session": "^1.17.3",
+    "googleapis": "^128.0.0",
+    "@azure/msal-node": "^2.6.0",
+    "sql.js": "^1.9.0",
+    "pdfkit": "^0.14.0"
+  }
+}
