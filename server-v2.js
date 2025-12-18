@@ -60,22 +60,35 @@ async function initDatabase() {
     db = new SQL.Database();
   }
 
+  // Users table - primary account holder
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      primary_email TEXT UNIQUE NOT NULL,
+      created_at INTEGER DEFAULT (strftime('%s', 'now'))
+    )
+  `);
+
+  // Accounts table - linked email accounts
   db.run(`
     CREATE TABLE IF NOT EXISTS accounts (
       id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
       email TEXT NOT NULL,
       provider TEXT NOT NULL,
       access_token TEXT,
       refresh_token TEXT,
       token_expiry INTEGER,
       created_at INTEGER DEFAULT (strftime('%s', 'now')),
-      last_synced INTEGER
+      last_synced INTEGER,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `);
 
   db.run(`
     CREATE TABLE IF NOT EXISTS subscriptions (
       id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
       account_id TEXT NOT NULL,
       name TEXT NOT NULL,
       price REAL,
@@ -90,9 +103,19 @@ async function initDatabase() {
       is_active INTEGER DEFAULT 1,
       created_at INTEGER DEFAULT (strftime('%s', 'now')),
       updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
     )
   `);
+
+  // Migration: add user_id to existing tables if needed
+  try {
+    db.run(`ALTER TABLE accounts ADD COLUMN user_id TEXT`);
+  } catch (e) { /* column exists */ }
+  
+  try {
+    db.run(`ALTER TABLE subscriptions ADD COLUMN user_id TEXT`);
+  } catch (e) { /* column exists */ }
 
   saveDatabase();
   console.log('Database initialized');
@@ -131,12 +154,24 @@ function dbRun(sql, params = []) {
 // ============================================
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json());
+
+// Trust proxy for Railway/Heroku (required for secure cookies behind proxy)
+app.set('trust proxy', 1);
+
 app.use(session({
   secret: config.session.secret,
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
+  cookie: { 
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true,
+    maxAge: 10 * 24 * 60 * 60 * 1000, // 10 days
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
+  }
 }));
+
+// Serve static frontend files (for combined deployment)
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ============================================
 // GOOGLE OAUTH
@@ -168,21 +203,46 @@ app.get('/auth/google/callback', async (req, res) => {
     const userInfo = await oauth2.userinfo.get();
     const email = userInfo.data.email;
     
-    // Check if account already exists
-    const existing = dbGet('SELECT id FROM accounts WHERE email = ? AND provider = ?', [email, 'google']);
+    let userId = req.session.userId;
     
-    if (existing) {
+    // Check if this email account already exists
+    const existingAccount = dbGet('SELECT id, user_id FROM accounts WHERE email = ? AND provider = ?', [email, 'google']);
+    
+    if (existingAccount) {
+      // Account exists - update tokens and log in as that user
       dbRun(
         `UPDATE accounts SET access_token = ?, refresh_token = COALESCE(?, refresh_token), token_expiry = ? WHERE id = ?`,
-        [tokens.access_token, tokens.refresh_token, tokens.expiry_date, existing.id]
+        [tokens.access_token, tokens.refresh_token, tokens.expiry_date, existingAccount.id]
       );
+      userId = existingAccount.user_id;
     } else {
+      // New account
+      if (!userId) {
+        // No session - check if user exists or create new
+        const existingUser = dbGet('SELECT id FROM users WHERE primary_email = ?', [email]);
+        
+        if (existingUser) {
+          userId = existingUser.id;
+        } else {
+          // Create new user
+          userId = crypto.randomUUID();
+          dbRun(
+            `INSERT INTO users (id, primary_email) VALUES (?, ?)`,
+            [userId, email]
+          );
+        }
+      }
+      
+      // Create new account linked to user
       const accountId = crypto.randomUUID();
       dbRun(
-        `INSERT INTO accounts (id, email, provider, access_token, refresh_token, token_expiry) VALUES (?, ?, 'google', ?, ?, ?)`,
-        [accountId, email, tokens.access_token, tokens.refresh_token, tokens.expiry_date]
+        `INSERT INTO accounts (id, user_id, email, provider, access_token, refresh_token, token_expiry) VALUES (?, ?, ?, 'google', ?, ?, ?)`,
+        [accountId, userId, email, tokens.access_token, tokens.refresh_token, tokens.expiry_date]
       );
     }
+    
+    // Store user in session
+    req.session.userId = userId;
     
     res.redirect(FRONTEND_URL + '?connected=google&email=' + encodeURIComponent(email));
   } catch (error) {
@@ -251,21 +311,46 @@ app.get('/auth/microsoft/callback', async (req, res) => {
     
     console.log('Microsoft callback: Connected account:', email);
     
-    // Check if account already exists
-    const existing = dbGet('SELECT id FROM accounts WHERE email = ? AND provider = ?', [email, 'microsoft']);
+    let userId = req.session.userId;
     
-    if (existing) {
+    // Check if this email account already exists
+    const existingAccount = dbGet('SELECT id, user_id FROM accounts WHERE email = ? AND provider = ?', [email, 'microsoft']);
+    
+    if (existingAccount) {
+      // Account exists - update tokens and log in as that user
       dbRun(
         `UPDATE accounts SET access_token = ?, token_expiry = ? WHERE id = ?`,
-        [tokenResponse.accessToken, tokenResponse.expiresOn?.getTime(), existing.id]
+        [tokenResponse.accessToken, tokenResponse.expiresOn?.getTime(), existingAccount.id]
       );
+      userId = existingAccount.user_id;
     } else {
+      // New account
+      if (!userId) {
+        // No session - check if user exists or create new
+        const existingUser = dbGet('SELECT id FROM users WHERE primary_email = ?', [email]);
+        
+        if (existingUser) {
+          userId = existingUser.id;
+        } else {
+          // Create new user
+          userId = crypto.randomUUID();
+          dbRun(
+            `INSERT INTO users (id, primary_email) VALUES (?, ?)`,
+            [userId, email]
+          );
+        }
+      }
+      
+      // Create new account linked to user
       const accountId = crypto.randomUUID();
       dbRun(
-        `INSERT INTO accounts (id, email, provider, access_token, token_expiry) VALUES (?, ?, 'microsoft', ?, ?)`,
-        [accountId, email, tokenResponse.accessToken, tokenResponse.expiresOn?.getTime()]
+        `INSERT INTO accounts (id, user_id, email, provider, access_token, token_expiry) VALUES (?, ?, ?, 'microsoft', ?, ?)`,
+        [accountId, userId, email, tokenResponse.accessToken, tokenResponse.expiresOn?.getTime()]
       );
     }
+    
+    // Store user in session
+    req.session.userId = userId;
     
     res.redirect(FRONTEND_URL + '?connected=microsoft&email=' + encodeURIComponent(email));
   } catch (error) {
@@ -278,54 +363,98 @@ app.get('/auth/microsoft/callback', async (req, res) => {
 // API ENDPOINTS
 // ============================================
 
-// Get all connected accounts
-app.get('/api/accounts', (req, res) => {
+// Middleware to check authentication
+function requireAuth(req, res, next) {
+  if (!req.session.userId) {
+    return res.status(401).json({ error: 'Not logged in' });
+  }
+  next();
+}
+
+// Get current user status
+app.get('/api/me', (req, res) => {
+  if (!req.session.userId) {
+    return res.json({ loggedIn: false });
+  }
+  
+  const user = dbGet('SELECT id, primary_email FROM users WHERE id = ?', [req.session.userId]);
+  if (!user) {
+    return res.json({ loggedIn: false });
+  }
+  
+  res.json({
+    loggedIn: true,
+    userId: user.id,
+    email: user.primary_email
+  });
+});
+
+// Logout
+app.post('/api/logout', (req, res) => {
+  req.session.destroy();
+  res.json({ success: true });
+});
+
+// Get all connected accounts (for current user)
+app.get('/api/accounts', requireAuth, (req, res) => {
   const accounts = dbAll(`
     SELECT id, email, provider, last_synced, created_at
     FROM accounts
+    WHERE user_id = ?
     ORDER BY created_at DESC
-  `);
+  `, [req.session.userId]);
   res.json(accounts);
 });
 
-// Remove an account
-app.delete('/api/accounts/:id', (req, res) => {
+// Remove an account (only if belongs to current user)
+app.delete('/api/accounts/:id', requireAuth, (req, res) => {
   const { id } = req.params;
+  const account = dbGet('SELECT user_id FROM accounts WHERE id = ?', [id]);
+  
+  if (!account || account.user_id !== req.session.userId) {
+    return res.status(403).json({ error: 'Not your account' });
+  }
+  
   dbRun('DELETE FROM subscriptions WHERE account_id = ?', [id]);
   dbRun('DELETE FROM accounts WHERE id = ?', [id]);
   res.json({ success: true });
 });
 
-// Get all subscriptions
-app.get('/api/subscriptions', (req, res) => {
+// Get all subscriptions (for current user)
+app.get('/api/subscriptions', requireAuth, (req, res) => {
   const subscriptions = dbAll(`
     SELECT s.*, a.email as account_email, a.provider as account_provider
     FROM subscriptions s
     JOIN accounts a ON s.account_id = a.id
-    WHERE s.is_active = 1
+    WHERE s.user_id = ? AND s.is_active = 1
     ORDER BY s.price DESC
-  `);
+  `, [req.session.userId]);
   res.json(subscriptions);
 });
 
-// Manually add a subscription
-app.post('/api/subscriptions', (req, res) => {
+// Manually add a subscription (for current user)
+app.post('/api/subscriptions', requireAuth, (req, res) => {
   const { name, price, currency, billing_cycle, category, account_id } = req.body;
   const id = crypto.randomUUID();
   
   dbRun(
-    `INSERT INTO subscriptions (id, account_id, name, price, currency, billing_cycle, category) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [id, account_id || 'manual', name, price, currency || 'USD', billing_cycle, category]
+    `INSERT INTO subscriptions (id, user_id, account_id, name, price, currency, billing_cycle, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, req.session.userId, account_id || 'manual', name, price, currency || 'USD', billing_cycle, category]
   );
   
   res.json({ id, success: true });
 });
 
-// Update a subscription
-app.patch('/api/subscriptions/:id', (req, res) => {
+// Update a subscription (only if belongs to current user)
+app.patch('/api/subscriptions/:id', requireAuth, (req, res) => {
   const { id } = req.params;
-  const updates = req.body;
+  const sub = dbGet('SELECT user_id FROM subscriptions WHERE id = ?', [id]);
   
+  if (!sub || sub.user_id !== req.session.userId) {
+    return res.status(403).json({ error: 'Not your subscription' });
+  }
+  
+  const updates = req.body;
   const allowedFields = ['name', 'price', 'currency', 'billing_cycle', 'category', 'is_active'];
   const fields = Object.keys(updates).filter(k => allowedFields.includes(k));
   
@@ -338,22 +467,28 @@ app.patch('/api/subscriptions/:id', (req, res) => {
   res.json({ success: true });
 });
 
-// Delete a subscription
-app.delete('/api/subscriptions/:id', (req, res) => {
+// Delete a subscription (only if belongs to current user)
+app.delete('/api/subscriptions/:id', requireAuth, (req, res) => {
   const { id } = req.params;
+  const sub = dbGet('SELECT user_id FROM subscriptions WHERE id = ?', [id]);
+  
+  if (!sub || sub.user_id !== req.session.userId) {
+    return res.status(403).json({ error: 'Not your subscription' });
+  }
+  
   dbRun('DELETE FROM subscriptions WHERE id = ?', [id]);
   res.json({ success: true });
 });
 
-// Clear all subscriptions (for re-syncing)
-app.delete('/api/subscriptions', (req, res) => {
-  dbRun('DELETE FROM subscriptions');
+// Clear all subscriptions for current user
+app.delete('/api/subscriptions', requireAuth, (req, res) => {
+  dbRun('DELETE FROM subscriptions WHERE user_id = ?', [req.session.userId]);
   res.json({ success: true, message: 'All subscriptions cleared' });
 });
 
 // Sync emails for all accounts
-app.post('/api/sync', async (req, res) => {
-  const accounts = dbAll('SELECT * FROM accounts');
+app.post('/api/sync', requireAuth, async (req, res) => {
+  const accounts = dbAll('SELECT * FROM accounts WHERE user_id = ?', [req.session.userId]);
   const results = { synced: 0, subscriptions_found: 0, errors: [] };
   
   for (const account of accounts) {
@@ -369,7 +504,7 @@ app.post('/api/sync', async (req, res) => {
       const subscriptions = await parseSubscriptionEmails(emails, account.email);
       
       for (const sub of subscriptions) {
-        saveSubscription(account.id, sub);
+        saveSubscription(req.session.userId, account.id, sub);
         results.subscriptions_found++;
       }
       
@@ -385,8 +520,8 @@ app.post('/api/sync', async (req, res) => {
 });
 
 // Sync all accounts and return PDF report
-app.post('/api/sync-and-report', async (req, res) => {
-  const accounts = dbAll('SELECT * FROM accounts');
+app.post('/api/sync-and-report', requireAuth, async (req, res) => {
+  const accounts = dbAll('SELECT * FROM accounts WHERE user_id = ?', [req.session.userId]);
   
   if (accounts.length === 0) {
     return res.status(400).json({ error: 'No email accounts connected. Please connect Gmail or Outlook first.' });
@@ -407,7 +542,7 @@ app.post('/api/sync-and-report', async (req, res) => {
       const subscriptions = await parseSubscriptionEmails(emails, account.email);
       
       for (const sub of subscriptions) {
-        saveSubscription(account.id, sub);
+        saveSubscription(req.session.userId, account.id, sub);
       }
       
       dbRun("UPDATE accounts SET last_synced = strftime('%s', 'now') WHERE id = ?", [account.id]);
@@ -418,7 +553,7 @@ app.post('/api/sync-and-report', async (req, res) => {
   
   // Generate and return PDF
   try {
-    const pdfBuffer = await generateSubscriptionReport();
+    const pdfBuffer = await generateSubscriptionReport(req.session.userId);
     const filename = `subscription-report-${new Date().toISOString().split('T')[0]}.pdf`;
     
     res.setHeader('Content-Type', 'application/pdf');
@@ -433,9 +568,9 @@ app.post('/api/sync-and-report', async (req, res) => {
 });
 
 // Sync single account
-app.post('/api/accounts/:id/sync', async (req, res) => {
+app.post('/api/accounts/:id/sync', requireAuth, async (req, res) => {
   const { id } = req.params;
-  const account = dbGet('SELECT * FROM accounts WHERE id = ?', [id]);
+  const account = dbGet('SELECT * FROM accounts WHERE id = ? AND user_id = ?', [id, req.session.userId]);
   
   if (!account) {
     return res.status(404).json({ error: 'Account not found' });
@@ -454,7 +589,7 @@ app.post('/api/accounts/:id/sync', async (req, res) => {
     let newCount = 0;
     
     for (const sub of subscriptions) {
-      const isNew = saveSubscription(account.id, sub);
+      const isNew = saveSubscription(req.session.userId, account.id, sub);
       if (isNew) newCount++;
     }
     
@@ -473,25 +608,27 @@ app.post('/api/accounts/:id/sync', async (req, res) => {
 });
 
 // Dashboard stats
-app.get('/api/stats', (req, res) => {
+app.get('/api/stats', requireAuth, (req, res) => {
+  const userId = req.session.userId;
+  
   const monthlyResult = dbGet(`
     SELECT COALESCE(SUM(CASE 
       WHEN billing_cycle = 'yearly' THEN price / 12 
       ELSE price 
     END), 0) as total
-    FROM subscriptions WHERE is_active = 1
-  `);
+    FROM subscriptions WHERE is_active = 1 AND user_id = ?
+  `, [userId]);
   
   const yearlyResult = dbGet(`
     SELECT COALESCE(SUM(CASE 
       WHEN billing_cycle = 'monthly' THEN price * 12 
       ELSE price 
     END), 0) as total
-    FROM subscriptions WHERE is_active = 1
-  `);
+    FROM subscriptions WHERE is_active = 1 AND user_id = ?
+  `, [userId]);
   
-  const countResult = dbGet('SELECT COUNT(*) as count FROM subscriptions WHERE is_active = 1');
-  const accountsResult = dbGet('SELECT COUNT(*) as count FROM accounts');
+  const countResult = dbGet('SELECT COUNT(*) as count FROM subscriptions WHERE is_active = 1 AND user_id = ?', [userId]);
+  const accountsResult = dbGet('SELECT COUNT(*) as count FROM accounts WHERE user_id = ?', [userId]);
   
   const stats = {
     total_monthly: monthlyResult?.total || 0,
@@ -505,10 +642,10 @@ app.get('/api/stats', (req, res) => {
         ELSE price 
       END) as total
       FROM subscriptions 
-      WHERE is_active = 1 AND category IS NOT NULL
+      WHERE is_active = 1 AND user_id = ? AND category IS NOT NULL
       GROUP BY category
       ORDER BY total DESC
-    `),
+    `, [userId]),
     
     by_account: dbAll(`
       SELECT a.email, a.provider, SUM(CASE 
@@ -517,10 +654,10 @@ app.get('/api/stats', (req, res) => {
       END) as total
       FROM subscriptions s
       JOIN accounts a ON s.account_id = a.id
-      WHERE s.is_active = 1
+      WHERE s.is_active = 1 AND s.user_id = ?
       GROUP BY a.id
       ORDER BY total DESC
-    `),
+    `, [userId]),
   };
   
   res.json(stats);
@@ -530,29 +667,29 @@ app.get('/api/stats', (req, res) => {
 // PDF REPORT GENERATION
 // ============================================
 
-function generateSubscriptionReport() {
+function generateSubscriptionReport(userId) {
   return new Promise((resolve, reject) => {
     if (!PDFDocument) {
       return reject(new Error('pdfkit not installed'));
     }
     
-    // Get all data
+    // Get all data for this user
     const subscriptions = dbAll(`
       SELECT s.*, a.email as account_email, a.provider
       FROM subscriptions s
       JOIN accounts a ON s.account_id = a.id
-      WHERE s.is_active = 1
+      WHERE s.is_active = 1 AND s.user_id = ?
       ORDER BY 
         CASE WHEN s.billing_cycle = 'yearly' THEN s.price / 12 ELSE s.price END DESC
-    `);
+    `, [userId]);
     
     const monthlyTotal = dbGet(`
       SELECT COALESCE(SUM(CASE 
         WHEN billing_cycle = 'yearly' THEN price / 12 
         ELSE price 
       END), 0) as total
-      FROM subscriptions WHERE is_active = 1
-    `)?.total || 0;
+      FROM subscriptions WHERE is_active = 1 AND user_id = ?
+    `, [userId])?.total || 0;
     
     const yearlyTotal = monthlyTotal * 12;
     
@@ -561,10 +698,10 @@ function generateSubscriptionReport() {
         COUNT(*) as count,
         SUM(CASE WHEN billing_cycle = 'yearly' THEN price / 12 ELSE price END) as monthly_total
       FROM subscriptions 
-      WHERE is_active = 1 AND category IS NOT NULL
+      WHERE is_active = 1 AND user_id = ? AND category IS NOT NULL
       GROUP BY category
       ORDER BY monthly_total DESC
-    `);
+    `, [userId]);
     
     // Create PDF
     const doc = new PDFDocument({ 
@@ -787,9 +924,9 @@ function generateSubscriptionReport() {
 }
 
 // PDF download endpoint
-app.get('/api/report/pdf', async (req, res) => {
+app.get('/api/report/pdf', requireAuth, async (req, res) => {
   try {
-    const pdfBuffer = await generateSubscriptionReport();
+    const pdfBuffer = await generateSubscriptionReport(req.session.userId);
     
     const filename = `subscription-report-${new Date().toISOString().split('T')[0]}.pdf`;
     
@@ -2250,19 +2387,13 @@ async function parseSubscriptionEmails(emails, accountEmail = '') {
   return subsWithPrice;
 }
 
-function saveSubscription(accountId, sub) {
+function saveSubscription(userId, accountId, sub) {
   // Normalize the subscription name
   const normalizedName = normalizeCompanyName(sub.name);
   const dedupKey = getDeduplicationKey(sub.name);
   
-  // Check if already exists (using normalized comparison)
-  const existing = dbGet(
-    `SELECT id, name FROM subscriptions WHERE account_id = ?`, 
-    [accountId]
-  );
-  
-  // Check all existing subscriptions for this account
-  const allExisting = dbAll(`SELECT id, name FROM subscriptions WHERE account_id = ?`, [accountId]);
+  // Check all existing subscriptions for this user
+  const allExisting = dbAll(`SELECT id, name FROM subscriptions WHERE user_id = ?`, [userId]);
   
   for (const row of allExisting) {
     const existingKey = getDeduplicationKey(row.name);
@@ -2278,12 +2409,23 @@ function saveSubscription(accountId, sub) {
   // Insert new
   const id = crypto.randomUUID();
   dbRun(
-    `INSERT INTO subscriptions (id, account_id, name, price, currency, billing_cycle, category, sender_email, detected_from_subject, confidence, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-    [id, accountId, normalizedName, sub.price, sub.currency || 'USD', sub.billing_cycle, sub.category, sub.sender_email, sub.detected_from_subject, sub.confidence]
+    `INSERT INTO subscriptions (id, user_id, account_id, name, price, currency, billing_cycle, category, sender_email, detected_from_subject, confidence, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+    [id, userId, accountId, normalizedName, sub.price, sub.currency || 'USD', sub.billing_cycle, sub.category, sub.sender_email, sub.detected_from_subject, sub.confidence]
   );
   
   return true;
 }
+
+// ============================================
+// CATCH-ALL: Serve React frontend
+// ============================================
+app.get('*', (req, res) => {
+  // Don't serve index.html for API routes
+  if (req.path.startsWith('/api/') || req.path.startsWith('/auth/')) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 // ============================================
 // START SERVER
